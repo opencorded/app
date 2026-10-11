@@ -78,15 +78,15 @@ install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   COMPONENT Runtime)
 
-# The Corded core, built separately (the repository's own CMake build makes
-# corded.dll). CORDED_CORE_DLL says where it is; it goes beside the program.
+# The Corded core, fetched from its release (fetch-core.sh windows) or built
+# from its own repository. CORDED_CORE_DLL says where it is; it goes beside the program.
 if(DEFINED ENV{CORDED_CORE_DLL})
   file(TO_CMAKE_PATH "$ENV{CORDED_CORE_DLL}" CORDED_CORE_DLL)
 else()
-  set(CORDED_CORE_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../../../../build/windows/bin/corded.dll")
+  set(CORDED_CORE_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../../core/windows/corded.dll")
 endif()
 if(NOT EXISTS "${CORDED_CORE_DLL}")
-  message(FATAL_ERROR "The Corded core was not found at ${CORDED_CORE_DLL}. Build it first, or set CORDED_CORE_DLL.")
+  message(FATAL_ERROR "The Corded core was not found at ${CORDED_CORE_DLL}. Run fetch-core.sh windows at the top of this repository, or set CORDED_CORE_DLL.")
 endif()
 install(FILES "${CORDED_CORE_DLL}" DESTINATION "${CMAKE_INSTALL_PREFIX}" COMPONENT Runtime)
 

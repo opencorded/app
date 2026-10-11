@@ -1,0 +1,261 @@
+name: Build
+
+# Builds the app for Android, Linux and Windows against the Corded core named
+# in core.version. Every push keeps downloadable builds; a tag starting with
+# "v" also publishes a release, signed like every Corded release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: 3.47.7
+
+jobs:
+  binding:
+    name: The binding, against a real server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: The core
+        run: ./fetch-core.sh linux
+      - uses: dart-lang/setup-dart@v1
+      - name: Analyze and test
+        working-directory: packages/corded_dart
+        env:
+          CORDED_BIN: ${{ github.workspace }}/core/linux
+          CORDED_LIB: ${{ github.workspace }}/core/linux/libcorded.so
+        run: |
+          dart pub get
+          dart analyze --fatal-infos
+          dart test
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # An older Debian, so the result also runs on systems with an older C library.
+    container: debian:12
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git curl openssl tar gzip cmake ninja-build pkg-config \
+            clang libgtk-3-dev liblzma-dev libsecret-1-dev xz-utils libglu1-mesa unzip zip
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The core
+        run: ./fetch-core.sh linux
+      - name: Build
+        id: app
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(git describe --tags --match 'v*' --always)
+          app="corded-app-${version}-linux-x86_64"
+          git clone --quiet --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git /opt/flutter
+          git config --global --add safe.directory /opt/flutter
+          export PATH="/opt/flutter/bin:$PATH"
+          flutter config --no-analytics >/dev/null
+          cd app
+          flutter pub get
+          flutter build linux --release --dart-define=CORDED_VERSION="$version"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p "dist/${app}"
+          cp -r app/build/linux/x64/release/bundle/. "dist/${app}/"
+          cp packaging/README-desktop.txt "dist/${app}/README.txt"
+          tar -C dist -czf "${app}.tar.gz" "${app}"
+          # Signed, so an app only installs an update that is ours.
+          if [ -n "$RELEASE_SIGNING_KEY" ] && [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            key="$(mktemp)"; chmod 600 "$key"; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+            openssl pkeyutl -sign -rawin -inkey "$key" -in "${app}.tar.gz" -out "${app}.tar.gz.sig"
+            rm -f "$key"
+            openssl pkeyutl -verify -rawin -pubin -inkey packaging/release-signing.pub -in "${app}.tar.gz" -sigfile "${app}.tar.gz.sig"
+          fi
+          echo "name=${app}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.app.outputs.name }}
+          path: ${{ steps.app.outputs.name }}.tar.gz
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apt-get install -y --no-install-recommends gh || true
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --prerelease \
+            --notes "The Corded app ${tag}, built on the Corded core $(cat core.version). Pre-alpha; not security audited." \
+            || gh release view "$tag" >/dev/null  # another job made it in the same moment
+          gh release upload "$tag" "${{ steps.app.outputs.name }}.tar.gz" --clobber
+          if [ -f "${{ steps.app.outputs.name }}.tar.gz.sig" ]; then
+            gh release upload "$tag" "${{ steps.app.outputs.name }}.tar.gz.sig" --clobber
+          fi
+
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The core
+        run: ./fetch-core.sh android
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      # With the signing key in the repository's secrets, every build can be
+      # installed over the last. Without it the app is signed with a throwaway
+      # key and has to be uninstalled before a newer one goes on.
+      - name: Analyze, test and build
+        working-directory: app
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          CORDED_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/corded.jks"
+            export CORDED_KEYSTORE="$RUNNER_TEMP/corded.jks"
+          else
+            echo "::warning::No signing key in secrets; this APK is signed with a throwaway key."
+          fi
+          version=$(git describe --tags --match 'v*' --always)
+          flutter pub get
+          flutter analyze --fatal-infos
+          flutter test
+          flutter build apk --release --target-platform android-arm64 --split-per-abi \
+            --build-name "$(echo "$version" | sed 's/^v//')" --build-number "$(( ($(date +%s) - 1767225600) / 600 ))" \
+            --dart-define=CORDED_VERSION="$version"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "$GITHUB_WORKSPACE/corded-android-arm64.apk"
+          cd "$GITHUB_WORKSPACE"
+          if [ -n "$RELEASE_SIGNING_KEY" ] && [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            key="$(mktemp)"; chmod 600 "$key"; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+            openssl pkeyutl -sign -rawin -inkey "$key" -in "corded-android-arm64.apk" -out "corded-android-arm64.apk.sig"
+            rm -f "$key"
+            openssl pkeyutl -verify -rawin -pubin -inkey packaging/release-signing.pub -in "corded-android-arm64.apk" -sigfile "corded-android-arm64.apk.sig"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corded-android-arm64
+          path: corded-android-arm64.apk
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --prerelease \
+            --notes "The Corded app ${tag}, built on the Corded core $(cat core.version). Pre-alpha; not security audited." \
+            || gh release view "$tag" >/dev/null  # another job made it in the same moment
+          gh release upload "$tag" corded-android-arm64.apk --clobber
+          if [ -f corded-android-arm64.apk.sig ]; then gh release upload "$tag" corded-android-arm64.apk.sig --clobber; fi
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The core
+        shell: bash
+        run: ./fetch-core.sh windows
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - uses: dart-lang/setup-dart@v1
+
+      # The update step is started exactly as the app starts it, by a program
+      # that ends at once, and has to replace the files and say OK.
+      - name: Check the app's update script
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'update-check'
+          $target = Join-Path $work 'app folder'      # a space, as in real paths
+          $source = Join-Path $work 'new'
+          New-Item -ItemType Directory -Force $target, $source, (Join-Path $source 'data') | Out-Null
+          Copy-Item C:\Windows\System32\ping.exe (Join-Path $target 'corded_app.exe')
+          Set-Content (Join-Path $target 'old.txt') 'old'
+          Copy-Item C:\Windows\System32\whoami.exe (Join-Path $source 'corded_app.exe')
+          Set-Content (Join-Path $source 'data\new.txt') 'new'
+          $running = Start-Process -FilePath (Join-Path $target 'corded_app.exe') -ArgumentList '-n','6','127.0.0.1' -PassThru -WindowStyle Hidden
+          $log = Join-Path $work 'update.log'
+          dart app\tool\launch_update.dart (Resolve-Path app\assets\apply-update.ps1) `
+            $running.Id $source $target (Join-Path $target 'corded_app.exe') $log
+          $global:LASTEXITCODE = 0
+          $ok = $false
+          for ($i = 0; $i -lt 60 -and -not $ok; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern '  OK$' -Quiet)) { $ok = $true }
+          }
+          if (Test-Path $log) { Get-Content $log } else { 'no log was written: the script never ran' }
+          if (-not $ok) { throw 'the update did not happen' }
+          $new = (Get-FileHash (Join-Path $source 'corded_app.exe')).Hash
+          $now = (Get-FileHash (Join-Path $target 'corded_app.exe')).Hash
+          if ($new -ne $now) { throw 'the program was not replaced' }
+          if (-not (Test-Path (Join-Path $target 'data\new.txt'))) { throw 'a new file in a folder did not arrive' }
+          if (-not (Test-Path (Join-Path $target 'old.txt'))) { throw 'a file the update does not carry was removed' }
+
+      - name: Build
+        id: app
+        shell: pwsh
+        run: |
+          $version = git describe --tags --match 'v*' --always
+          $app = "corded-app-$version-windows-x64"
+          Push-Location app
+          flutter pub get
+          flutter build windows --release "--dart-define=CORDED_VERSION=$version"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Pop-Location
+          New-Item -ItemType Directory -Force "dist\$app" | Out-Null
+          Copy-Item -Recurse app\build\windows\x64\runner\Release\* "dist\$app\"
+          Copy-Item packaging\README-desktop.txt "dist\$app\README.txt"
+          Compress-Archive -Path "dist\$app" -DestinationPath "$app.zip"
+          "name=$app" >> $env:GITHUB_OUTPUT
+      - name: Sign
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then echo "no release key set; unsigned"; exit 0; fi
+          file="${{ steps.app.outputs.name }}.zip"
+          key="$(mktemp)"; chmod 600 "$key"; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in "$file" -out "$file.sig"
+          rm -f "$key"
+          openssl pkeyutl -verify -rawin -pubin -inkey packaging/release-signing.pub -in "$file" -sigfile "$file.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.app.outputs.name }}
+          path: ${{ steps.app.outputs.name }}.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --prerelease \
+            --notes "The Corded app ${tag}, built on the Corded core $(cat core.version). Pre-alpha; not security audited." \
+            || gh release view "$tag" >/dev/null  # another job made it in the same moment
+          gh release upload "$tag" "${{ steps.app.outputs.name }}.zip" --clobber
+          if [ -f "${{ steps.app.outputs.name }}.zip.sig" ]; then gh release upload "$tag" "${{ steps.app.outputs.name }}.zip.sig" --clobber; fi

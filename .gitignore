@@ -1,0 +1,4 @@
+core/
+**/build/
+.dart_tool/
+*.iml

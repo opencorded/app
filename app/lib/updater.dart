@@ -22,7 +22,10 @@ import 'update_launch.dart';
 /// "v0.6.1-3-gabc1234" for a build made after it). "dev" for a build made by hand.
 const appVersion = String.fromEnvironment('CORDED_VERSION', defaultValue: 'dev');
 
-const _repository = 'AndrewCromar/corded';
+// Where releases of the app are looked for, in this order. The app has its
+// own repository; the one it used to be built in still carries its files,
+// for copies of the app made before the move.
+const _repositories = ['opencorded/app', 'AndrewCromar/corded'];
 
 class Update {
   const Update({required this.tag, required this.name, required this.url, required this.signatureUrl});
@@ -102,11 +105,23 @@ Future<Update?> checkForUpdate() async {
   if (assetName('v0.0.0') == null) return null;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
-    final body =
-        await _get(client, Uri.parse('https://api.github.com/repos/$_repository/releases?per_page=20'))
-            .timeout(const Duration(seconds: 20));
-    final releases = jsonDecode(utf8.decode(body));
-    return releases is List ? pickUpdate(releases, appVersion) : null;
+    Object? lastProblem;
+    var answered = false;
+    for (final repository in _repositories) {
+      try {
+        final body =
+            await _get(client, Uri.parse('https://api.github.com/repos/$repository/releases?per_page=20'))
+                .timeout(const Duration(seconds: 20));
+        answered = true;
+        final releases = jsonDecode(utf8.decode(body));
+        final found = releases is List ? pickUpdate(releases, appVersion) : null;
+        if (found != null) return found;
+      } catch (e) {
+        lastProblem = e; // the other place may still answer
+      }
+    }
+    if (!answered && lastProblem != null) throw lastProblem;
+    return null;
   } finally {
     client.close(force: true);
   }

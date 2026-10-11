@@ -1,22 +1,53 @@
 #!/usr/bin/env bash
-# Puts the Android builds of libcorded where the app's build looks for them.
-# They come from the newest successful CI run of the given branch (default: the
-# current one). Needs the GitHub CLI, signed in.
+# Fetches the Corded core this app is built against, checks that it carries
+# the release signature, and puts each piece where the builds look for it.
+#
+#   ./fetch-core.sh [linux] [android] [windows]        (no words: linux and android)
+#
+# Which core: the release named in core.version, from AndrewCromar/corded.
+# Needs curl, tar, unzip (for windows) and openssl.
 set -euo pipefail
 cd "$(dirname "$0")"
-branch="${1:-$(git rev-parse --abbrev-ref HEAD)}"
-# The newest finished run that has both Android builds, whatever became of its other jobs.
-run=""
-for id in $(gh run list --workflow CI --branch "$branch" --status completed --limit 8 --json databaseId --jq '.[].databaseId'); do
-  n=$(gh api "repos/{owner}/{repo}/actions/runs/$id/artifacts" --jq '[.artifacts[].name | select(startswith("libcorded-android-"))] | length')
-  if [ "$n" = "2" ]; then run="$id"; break; fi
-done
-[ -n "$run" ] || { echo "no CI run on $branch has the Android builds" >&2; exit 1; }
-echo "taking the core from CI run $run ($(gh run view "$run" --json headSha --jq '.headSha[0:7]'))"
-tmp=$(mktemp -d)
+version="${CORDED_CORE_VERSION:-$(tr -d '[:space:]' < core.version)}"   # the variable is for trying another core by hand
+base="https://github.com/AndrewCromar/corded/releases/download/${version}"
+wanted="${*:-linux android}"
+tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-for preset in android-arm64 android-x64; do
-  gh run download "$run" --name "libcorded-$preset" --dir "$tmp/$preset"
-  cp -r "$tmp/$preset/jniLibs/." app/android/app/src/main/jniLibs/
+
+fetch() {   # fetch <file name>: downloaded and its signature checked, or the script stops
+  curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
+  curl -fsSL --retry 3 -o "$tmp/$1.sig" "$base/$1.sig"
+  openssl pkeyutl -verify -rawin -pubin -inkey packaging/release-signing.pub -in "$tmp/$1" -sigfile "$tmp/$1.sig" >/dev/null \
+    || { echo "$1 does not carry the release signature; not used" >&2; exit 1; }
+}
+
+for part in $wanted; do
+  case "$part" in
+    linux)
+      name="corded-${version}-linux-x86_64"
+      fetch "$name.tar.gz"
+      mkdir -p core/linux
+      tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+      # The library for the app; the server and the headless client for the binding's test.
+      cp "$tmp/$name/libcorded.so" "$tmp/$name/cordedd" "$tmp/$name/corded-cli" core/linux/
+      ;;
+    android)
+      name="corded-core-${version}-android-arm64"
+      fetch "$name.tar.gz"
+      tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+      mkdir -p app/android/app/src/main/jniLibs
+      cp -r "$tmp/$name/jniLibs/." app/android/app/src/main/jniLibs/
+      ;;
+    windows)
+      name="corded-${version}-windows-x64"
+      curl -fsSL --retry 3 -o "$tmp/$name.zip" "$base/$name.zip"
+      # The Windows archive of the server is published without a signature of
+      # its own; its checksum is taken from the release page by whoever needs more.
+      mkdir -p core/windows
+      unzip -q -o "$tmp/$name.zip" -d "$tmp"
+      cp "$tmp/$name/corded.dll" core/windows/
+      ;;
+    *) echo "unknown part: $part (linux, android or windows)" >&2; exit 2 ;;
+  esac
+  echo "core ${version}: ${part} in place"
 done
-find app/android/app/src/main/jniLibs -name '*.so' -exec ls -l {} +

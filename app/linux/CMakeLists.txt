@@ -97,20 +97,20 @@ install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   COMPONENT Runtime)
 
-# The Corded core, built separately (./build.sh at the top of the repository,
-# or a release's libcorded.so). CORDED_CORE_LIB says where it is.
+# The Corded core, fetched from its release by ../../fetch-core.sh, or built
+# from its own repository. CORDED_CORE_LIB says where it is.
 if(DEFINED ENV{CORDED_CORE_LIB})
   set(CORDED_CORE_LIB "$ENV{CORDED_CORE_LIB}")
 else()
-  set(CORDED_CORE_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../../../build/dev/lib/libcorded.so")
+  set(CORDED_CORE_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../core/linux/libcorded.so")
 endif()
 if(NOT EXISTS "${CORDED_CORE_LIB}")
-  message(FATAL_ERROR "The Corded core was not found at ${CORDED_CORE_LIB}. Build it first with ./build.sh, or set CORDED_CORE_LIB.")
+  message(FATAL_ERROR "The Corded core was not found at ${CORDED_CORE_LIB}. Run ./fetch-core.sh at the top of this repository, or set CORDED_CORE_LIB.")
 endif()
 # The icon, and the script that puts the app in the desktop's menu with it.
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets/logo/variants/corded-icon-indigo.png"
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/corded.png"
   DESTINATION "${CMAKE_INSTALL_PREFIX}" RENAME corded.png COMPONENT Runtime)
-install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../packaging/install-desktop.sh"
+install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/install-desktop.sh"
   DESTINATION "${CMAKE_INSTALL_PREFIX}" RENAME install.sh COMPONENT Runtime)
 
 # The file itself, not a link to it, under the one name the app looks for.
